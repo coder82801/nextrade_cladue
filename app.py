@@ -371,6 +371,8 @@ def fetch_daily_bars(_client, symbol: str, days: int = 260) -> pd.DataFrame:
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_daily_bars_batch(_client, symbols: list[str], days: int = 260) -> dict[str, pd.DataFrame]:
     out = {}
+    if not symbols:
+        return out
     try:
         end = datetime.now(ZoneInfo("America/New_York"))
         start = end - timedelta(days=int(days * 1.6) + 10)
@@ -389,13 +391,133 @@ def fetch_daily_bars_batch(_client, symbols: list[str], days: int = 260) -> dict
         if isinstance(df.index, pd.MultiIndex):
             for sym in df.index.get_level_values(0).unique():
                 sub = df.loc[sym][["open", "high", "low", "close", "volume"]].copy()
-                sub.index = pd.to_datetime(sub.index)
+                if sub.index.tz is not None:
+                    sub.index = sub.index.tz_convert(None)
+                sub.index = pd.to_datetime(sub.index).normalize()
                 out[sym] = sub.tail(days)
         else:
-            out[symbols[0]] = df[["open", "high", "low", "close", "volume"]].tail(days)
+            sub = df[["open", "high", "low", "close", "volume"]].copy()
+            if sub.index.tz is not None:
+                sub.index = sub.index.tz_convert(None)
+            sub.index = pd.to_datetime(sub.index).normalize()
+            out[symbols[0]] = sub.tail(days)
     except Exception as e:
-        st.sidebar.warning(f"Alpaca batch hatasi: {e}")
+        st.error(f"Alpaca batch hatasi: {e}")
     return out
+
+
+def precompute_feature_series(df: pd.DataFrame, spy_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tum gunler icin tum gostergeleri VEKTORIZE sekilde hesaplar.
+    compute_features'un hizli, backtest dostu versiyonu.
+    Cikti: her gun icin feature satiri iceren DataFrame.
+    """
+    if df is None or df.empty or len(df) < 60:
+        return pd.DataFrame()
+
+    out = df.copy().sort_index()
+
+    # Rolling hacimler, ATR, OBV, SMA --- hepsi vektorize
+    out["avg_vol_20"] = out["volume"].rolling(20).mean()
+    out["rvol"] = out["volume"] / out["avg_vol_20"]
+
+    rng = out["high"] - out["low"]
+    out["close_strength"] = np.where(rng > 0, (out["close"] - out["low"]) / rng, np.nan)
+
+    out["prior_20d_high"] = out["high"].shift(1).rolling(20).max()
+    out["breakout_dist"] = np.where(
+        out["prior_20d_high"].notna() & (out["close"] < out["prior_20d_high"]),
+        (out["prior_20d_high"] - out["close"]) / out["close"],
+        0.0,
+    )
+
+    # VWAP (son 20 gun typical*volume / volume)
+    tp = (out["high"] + out["low"] + out["close"]) / 3
+    vp = tp * out["volume"]
+    vol20 = out["volume"].rolling(20).sum()
+    vp20 = vp.rolling(20).sum()
+    out["vwap_20d"] = np.where(vol20 > 0, vp20 / vol20, np.nan)
+    out["above_vwap"] = out["close"] > out["vwap_20d"]
+
+    # OBV
+    diff = out["close"].diff().fillna(0)
+    obv_step = np.where(diff > 0, out["volume"], np.where(diff < 0, -out["volume"], 0))
+    out["obv"] = pd.Series(obv_step, index=out.index).cumsum()
+    out["obv_slope_10"] = out["obv"] - out["obv"].shift(10)
+
+    # ATR5/14/20
+    out["tr"] = true_range(out)
+    out["atr5"] = out["tr"].rolling(5).mean()
+    out["atr14"] = out["tr"].rolling(14).mean()
+    out["atr20"] = out["tr"].rolling(20).mean()
+    out["atr_ratio"] = np.where(out["atr20"] > 0, out["atr5"] / out["atr20"], np.nan)
+
+    # SMA
+    out["sma50"] = out["close"].rolling(50).mean()
+    out["sma200"] = out["close"].rolling(200).mean()
+
+    # Gap
+    out["prev_close"] = out["close"].shift(1)
+    out["gap_pct"] = np.where(out["prev_close"] > 0, (out["open"] - out["prev_close"]) / out["prev_close"], 0.0)
+
+    # Relative Strength vs SPY
+    if spy_df is not None and not spy_df.empty:
+        spy_aligned = spy_df["close"].reindex(out.index).ffill()
+        stock_ret_10 = (out["close"] - out["close"].shift(10)) / out["close"].shift(10)
+        spy_ret_10 = (spy_aligned - spy_aligned.shift(10)) / spy_aligned.shift(10)
+        out["rs_10d"] = stock_ret_10 - spy_ret_10
+    else:
+        out["rs_10d"] = 0.0
+
+    # Sadece feature kolonlarini dondur
+    feat_cols = [
+        "open", "high", "low", "close", "volume",
+        "rvol", "close_strength", "prior_20d_high", "breakout_dist",
+        "vwap_20d", "above_vwap", "obv_slope_10",
+        "atr5", "atr14", "atr20", "atr_ratio",
+        "sma50", "sma200", "prev_close", "gap_pct", "rs_10d",
+    ]
+    return out[feat_cols].dropna(subset=["rvol", "close_strength", "atr14"])
+
+
+def passes_filters_row(row) -> bool:
+    """Vektorize kullanima uygun, tek satir filtreleme."""
+    try:
+        if row["close"] < MIN_PX or row["close"] > MAX_PX:
+            return False
+        if row["volume"] < MIN_VOL:
+            return False
+        if pd.isna(row["rvol"]) or row["rvol"] < MIN_RVOL:
+            return False
+        if pd.isna(row["close_strength"]) or row["close_strength"] < MIN_CS:
+            return False
+        if row["breakout_dist"] > MAX_DIST:
+            return False
+        if REQ_VWAP and not bool(row["above_vwap"]):
+            return False
+        if REQ_POS_RS and row["rs_10d"] <= 0:
+            return False
+        if REQ_POS_OBV and row["obv_slope_10"] <= 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def score_row(row) -> float:
+    """Vektorize kullanima uygun tek-satir skor."""
+    s_rvol = _clip((row["rvol"] - 1.0) / 4.0)
+    s_close = _clip(row["close_strength"])
+    s_breakout = _clip(1.0 - (row["breakout_dist"] / 0.05))
+    s_vwap = 1.0 if bool(row["above_vwap"]) else 0.0
+    s_obv = 1.0 if row["obv_slope_10"] > 0 else 0.0
+    s_atr = _clip((row["atr_ratio"] - 0.80) / 0.40) if pd.notna(row["atr_ratio"]) else 0.0
+    s_rel = _clip((row["rs_10d"] + 0.05) / 0.15)
+    val = (WEIGHTS["rvol"]*s_rvol + WEIGHTS["close_str"]*s_close +
+           WEIGHTS["breakout"]*s_breakout + WEIGHTS["vwap"]*s_vwap +
+           WEIGHTS["obv"]*s_obv + WEIGHTS["atr_expand"]*s_atr +
+           WEIGHTS["rel_str"]*s_rel)
+    return round(100.0 * val, 2)
 
 
 # ============================================================
@@ -576,129 +698,153 @@ with tab2:
     )
 
     if st.button("Backtesti Baslat", type="primary"):
-        with st.spinner("Evren cekiliyor..."):
+        try:
+            status = st.empty()
+            status.info("Asama 1/4: Evren cekiliyor (TradingView)...")
             symbols = tv_universe(max_records=bt_universe_size)
             if "SPY" not in symbols:
                 symbols.append("SPY")
 
-        st.info(f"{len(symbols)} sembol uzerinde backtest yapilacak.")
+            st.info(f"{len(symbols)} sembol uzerinde backtest yapilacak.")
 
-        progress = st.progress(0.0, text="Alpaca'dan veri indiriliyor...")
-        bars_map: dict[str, pd.DataFrame] = {}
-        step = 200
-        for i in range(0, len(symbols), step):
-            chunk = symbols[i:i + step]
-            got = fetch_daily_bars_batch(client, chunk, days=bt_days + 260)
-            bars_map.update(got)
-            progress.progress(min(1.0, (i + step) / len(symbols)))
-        progress.empty()
+            # --- Alpaca'dan veri indir (kucuk batch'lerle) ---
+            status.info("Asama 2/4: Alpaca'dan gunluk bar verisi indiriliyor...")
+            bars_map: dict[str, pd.DataFrame] = {}
+            step = 50  # Daha kucuk batch, hata izolasyonu icin
+            progress = st.progress(0.0, text="0/0")
+            total = len(symbols)
+            for i in range(0, total, step):
+                chunk = symbols[i:i + step]
+                got = fetch_daily_bars_batch(client, chunk, days=bt_days + 260)
+                bars_map.update(got)
+                done = min(i + step, total)
+                progress.progress(done / total, text=f"{done}/{total} sembol")
+            progress.empty()
 
-        spy_df = bars_map.get("SPY", pd.DataFrame())
+            if not bars_map:
+                st.error("Alpaca'dan hic veri alinamadi. API anahtarlarini kontrol et.")
+                st.stop()
 
-        # Test edilecek tarihleri belirle (son bt_days is gunu)
-        if spy_df.empty:
-            st.error("SPY verisi yok, backtest yapilamaz.")
-            st.stop()
-        test_dates = spy_df.index[-bt_days:]
+            spy_df = bars_map.get("SPY", pd.DataFrame())
+            if spy_df.empty:
+                st.error("SPY verisi yok, backtest yapilamaz. Alpaca baglantini kontrol et.")
+                st.stop()
 
-        trades = []
-        prog2 = st.progress(0.0, text="Tarihler taraniyor...")
-        total_dates = len(test_dates)
+            st.info(f"{len(bars_map)} sembol icin veri alindi.")
 
-        for di, dt in enumerate(test_dates):
-            # Sinyal hesabi: dt'ye kadar olan veri
-            for sym, df_full in bars_map.items():
-                if sym == "SPY":
-                    continue
-                df_hist = df_full.loc[:dt]
-                if len(df_hist) < 60:
-                    continue
-                # Ertesi gun var mi?
-                next_bars = df_full.loc[df_full.index > dt]
-                if next_bars.empty:
-                    continue
-                next_bar = next_bars.iloc[0]
+            # --- Asama 3: Tum sembollerin feature serisini VEKTORIZE hesapla ---
+            status.info("Asama 3/4: Gostergeler vektorize hesaplaniyor...")
+            feat_map: dict[str, pd.DataFrame] = {}
+            prog3 = st.progress(0.0, text="0/0")
+            syms_list = [s for s in bars_map.keys() if s != "SPY"]
+            for i, sym in enumerate(syms_list):
+                try:
+                    fs = precompute_feature_series(bars_map[sym], spy_df)
+                    if not fs.empty:
+                        feat_map[sym] = fs
+                except Exception:
+                    pass
+                if (i + 1) % 10 == 0 or i == len(syms_list) - 1:
+                    prog3.progress((i + 1) / len(syms_list), text=f"{i+1}/{len(syms_list)}")
+            prog3.empty()
 
-                # SPY tarihsel kesiti
-                spy_hist = spy_df.loc[:dt]
+            st.info(f"{len(feat_map)} sembolde gosterge hesaplandi.")
 
-                feats = compute_features(df_hist, spy_hist)
-                if feats is None:
-                    continue
-                passed, _ = passes_hard_filters(feats)
-                score, _ = signal_score(feats)
-                if not passed or score < MIN_SCORE:
-                    continue
+            # --- Asama 4: Tarihleri tara, sinyal uret, ertesi gun simulasyonu ---
+            status.info("Asama 4/4: Tarihler taraniyor, trade'ler simule ediliyor...")
+            test_dates = spy_df.index[-bt_days:]
+            trades = []
+            prog4 = st.progress(0.0, text=f"0/{len(test_dates)}")
 
-                levels = compute_trade_levels(feats)
-                entry = levels["entry"]
-                stop = levels["stop"]
-                tp1 = levels["tp1"]
-                tp2 = levels["tp2"]
+            for di, dt in enumerate(test_dates):
+                for sym, fs in feat_map.items():
+                    # dt tarihinin feature satirini al
+                    if dt not in fs.index:
+                        continue
+                    row = fs.loc[dt]
 
-                # Ertesi gun dolar mi? Limit = entry. Dolum sarti: next_low <= entry
-                filled = float(next_bar["low"]) <= entry
-                if not filled:
-                    trades.append({
-                        "date": dt.date(),
-                        "symbol": sym,
-                        "score": score,
-                        "entry": entry,
-                        "filled": False,
-                        "ret_pct": 0.0,
-                        "result": "NO_FILL",
-                    })
-                    continue
+                    # Filtreler
+                    if not passes_filters_row(row):
+                        continue
+                    score = score_row(row)
+                    if score < MIN_SCORE:
+                        continue
 
-                # Cikis modu
-                n_open = float(next_bar["open"])
-                n_high = float(next_bar["high"])
-                n_low = float(next_bar["low"])
-                n_close = float(next_bar["close"])
+                    # Entry/Stop/TP hesabi
+                    prior_high = row["prior_20d_high"]
+                    close = float(row["close"])
+                    atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else close * 0.05
+                    breakout_dist = float(row["breakout_dist"])
 
-                if bt_exit == "Ertesi gun OPEN":
-                    # Eger acilisa kadar stop vurduysa, open ~ low altinda olabilir; basitten git:
-                    exit_px = n_open
-                    result = "OPEN"
-                elif bt_exit == "Ertesi gun HIGH (en iyi durum)":
-                    exit_px = n_high
-                    result = "HIGH"
-                elif bt_exit == "Ertesi gun CLOSE":
-                    exit_px = n_close
-                    result = "CLOSE"
-                else:
-                    # Stop/TP simulasyonu: basit sekilde low/high'a bak
-                    if n_low <= stop:
-                        exit_px = stop
-                        result = "STOP"
-                    elif n_high >= tp2:
-                        exit_px = tp2
-                        result = "TP2"
-                    elif n_high >= tp1:
-                        exit_px = tp1
-                        result = "TP1"
+                    if pd.notna(prior_high) and breakout_dist <= 0.01:
+                        entry = round(max(close, float(prior_high) * 1.002), 4)
                     else:
-                        exit_px = n_close
-                        result = "CLOSE"
+                        entry = round(close * 1.002, 4)
+                    stop = round(max(entry - 1.2 * atr14, entry * 0.88), 4)
+                    if stop >= entry:
+                        stop = round(entry * 0.92, 4)
+                    risk = max(entry - stop, 0.01)
+                    tp1 = round(entry + 1.5 * risk, 4)
+                    tp2 = round(entry + 3.0 * risk, 4)
 
-                ret_pct = (exit_px - entry) / entry
-                trades.append({
-                    "date": dt.date(),
-                    "symbol": sym,
-                    "score": score,
-                    "entry": round(entry, 4),
-                    "exit": round(exit_px, 4),
-                    "stop": round(stop, 4),
-                    "tp1": round(tp1, 4),
-                    "tp2": round(tp2, 4),
-                    "filled": True,
-                    "ret_pct": round(ret_pct * 100, 3),
-                    "result": result,
-                })
+                    # Ertesi gun bar'ini bul
+                    full_df = bars_map[sym]
+                    next_bars = full_df.loc[full_df.index > dt]
+                    if next_bars.empty:
+                        continue
+                    next_bar = next_bars.iloc[0]
 
-            prog2.progress((di + 1) / total_dates)
+                    filled = float(next_bar["low"]) <= entry
+                    if not filled:
+                        trades.append({
+                            "date": dt.date(), "symbol": sym, "score": score,
+                            "entry": entry, "exit": None, "stop": stop,
+                            "tp1": tp1, "tp2": tp2, "filled": False,
+                            "ret_pct": 0.0, "result": "NO_FILL",
+                        })
+                        continue
 
-        prog2.empty()
+                    n_open = float(next_bar["open"])
+                    n_high = float(next_bar["high"])
+                    n_low = float(next_bar["low"])
+                    n_close = float(next_bar["close"])
+
+                    if bt_exit == "Ertesi gun OPEN":
+                        exit_px = n_open; result = "OPEN"
+                    elif bt_exit == "Ertesi gun HIGH (en iyi durum)":
+                        exit_px = n_high; result = "HIGH"
+                    elif bt_exit == "Ertesi gun CLOSE":
+                        exit_px = n_close; result = "CLOSE"
+                    else:
+                        if n_low <= stop:
+                            exit_px = stop; result = "STOP"
+                        elif n_high >= tp2:
+                            exit_px = tp2; result = "TP2"
+                        elif n_high >= tp1:
+                            exit_px = tp1; result = "TP1"
+                        else:
+                            exit_px = n_close; result = "CLOSE"
+
+                    ret_pct = (exit_px - entry) / entry
+                    trades.append({
+                        "date": dt.date(), "symbol": sym, "score": score,
+                        "entry": round(entry, 4), "exit": round(exit_px, 4),
+                        "stop": round(stop, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4),
+                        "filled": True, "ret_pct": round(ret_pct * 100, 3),
+                        "result": result,
+                    })
+
+                if (di + 1) % 5 == 0 or di == len(test_dates) - 1:
+                    prog4.progress((di + 1) / len(test_dates),
+                                   text=f"{di+1}/{len(test_dates)} gun | {len(trades)} sinyal")
+
+            prog4.empty()
+            status.empty()
+        except Exception as e:
+            st.error(f"Backtest hatasi: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            st.stop()
 
         trades_df = pd.DataFrame(trades)
         if trades_df.empty:
