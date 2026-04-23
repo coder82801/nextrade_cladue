@@ -228,12 +228,18 @@ def compute_features(df: pd.DataFrame, spy_df: pd.DataFrame) -> Optional[dict]:
     # 2) Kapanis gucu
     cs = closing_strength(last_close, last_low, last_high)
 
-    # 3) Kirilim uzakligi (bugunun kapanisina gore)
+    # 3) Kirilim uzakligi — DUZELTILDI: uzamis hisseler de gercek mesafe olarak hesaplanir
+    # signed_dist > 0: fiyat prior_high'ın ALTINDA (kirilmaya yakin / uzak)
+    # signed_dist < 0: fiyat prior_high'ın USTUNDE (uzamis)
     prior_20d_high = df["high"].shift(1).rolling(20).max().iloc[-1]
-    if pd.notna(prior_20d_high) and last_close < prior_20d_high:
-        breakout_dist = (prior_20d_high - last_close) / last_close
+    if pd.notna(prior_20d_high) and prior_20d_high > 0:
+        signed_dist = (prior_20d_high - last_close) / last_close
+        breakout_dist = abs(signed_dist)  # score icin mutlak mesafe
+        extension_pct = max(0.0, -signed_dist)  # kirilmanin UZERINDE ne kadar
     else:
+        signed_dist = np.nan
         breakout_dist = 0.0
+        extension_pct = 0.0
 
     # 4) 20g hacim agirlikli ortalama (gercek intraday VWAP DEGILDIR)
     recent_20 = df.tail(20)
@@ -280,6 +286,7 @@ def compute_features(df: pd.DataFrame, spy_df: pd.DataFrame) -> Optional[dict]:
         "close_strength": float(cs) if pd.notna(cs) else np.nan,
         "prior_20d_high": float(prior_20d_high) if pd.notna(prior_20d_high) else np.nan,
         "breakout_dist": float(breakout_dist),
+        "extension_pct": float(extension_pct),
         "vol_wavg_20d": float(vol_wavg_20d) if pd.notna(vol_wavg_20d) else np.nan,
         "above_volwavg": bool(above_volwavg),
         "obv_slope_10": float(obv_slope_10),
@@ -304,6 +311,12 @@ def signal_score(f: dict) -> tuple[float, dict]:
     s_rvol       = _clip((f["rvol"] - 1.0) / 4.0)                 # 1.0->0, 5.0->1
     s_close      = _clip(f["close_strength"])                      # 0..1
     s_breakout   = _clip(1.0 - (f["breakout_dist"] / 0.05))        # 0% -> 1, 5% -> 0
+    # DUZELTILDI: uzamis hisseler icin extension penalty
+    # extension 0-3% ok, 3-13% giderek azaltilir, >13% sifir
+    _ext = f.get("extension_pct", 0.0) or 0.0
+    if _ext > 0.03:
+        _ext_penalty = _clip((_ext - 0.03) / 0.10)
+        s_breakout *= (1.0 - _ext_penalty)
     s_volwavg    = 1.0 if f["above_volwavg"] else 0.0
     s_obv        = 1.0 if f["obv_slope_10"] > 0 else 0.0
     s_atr        = _clip((f["atr_ratio"] - 0.80) / 0.40) if pd.notna(f["atr_ratio"]) else 0.0
@@ -332,6 +345,9 @@ def passes_hard_filters(f: dict) -> tuple[bool, str]:
         return False, f"RVOL < {MIN_RVOL}"
     if pd.isna(f["close_strength"]) or f["close_strength"] < MIN_CS:
         return False, f"Kapanis gucu < {MIN_CS}"
+    # EK: asiri uzamis hisseleri ele (prior_20d_high'in %10 ustunde)
+    if f.get("extension_pct", 0.0) > 0.10:
+        return False, f"Asiri uzamis (%{f['extension_pct']*100:.1f})"
     if f["breakout_dist"] > MAX_DIST:
         return False, f"Kirilim uzakligi > {MAX_DIST*100:.1f}%"
     if REQ_VOLWAVG and not f["above_volwavg"]:
@@ -358,7 +374,14 @@ def compute_trade_levels(f: dict) -> dict:
     """
     prior_high = f["prior_20d_high"]
     close = f["close"]
-    breakout_mode = pd.notna(prior_high) and f["breakout_dist"] <= BREAKOUT_NEAR_PCT
+    # DUZELTILDI: breakout_mode sadece prior_high'a YAKIN (altinda veya cok az uzerinde) olanlar icin
+    # Uzamis hisseler (extension > %2) breakout_mode degildir — chase yapilmaz
+    _ext = f.get("extension_pct", 0.0) or 0.0
+    breakout_mode = (
+        pd.notna(prior_high)
+        and f["breakout_dist"] <= BREAKOUT_NEAR_PCT
+        and _ext <= 0.02
+    )
 
     # Entry: kirilima yakinsa prior high uzeri buffer; degilse kapanis uzeri buffer
     if breakout_mode:
@@ -523,9 +546,20 @@ def precompute_feature_series(df: pd.DataFrame, spy_df: pd.DataFrame) -> pd.Data
     out["close_strength"] = np.where(rng > 0, (out["close"] - out["low"]) / rng, np.nan)
 
     out["prior_20d_high"] = out["high"].shift(1).rolling(20).max()
-    out["breakout_dist"] = np.where(
-        out["prior_20d_high"].notna() & (out["close"] < out["prior_20d_high"]),
+    # DUZELTILDI: uzamis hisseler icin mutlak mesafe hesabi + extension_pct
+    _signed_dist = np.where(
+        out["prior_20d_high"].notna() & (out["prior_20d_high"] > 0),
         (out["prior_20d_high"] - out["close"]) / out["close"],
+        np.nan,
+    )
+    out["breakout_dist"] = np.where(
+        np.isfinite(_signed_dist),
+        np.abs(_signed_dist),
+        0.0,
+    )
+    out["extension_pct"] = np.where(
+        np.isfinite(_signed_dist),
+        np.maximum(0.0, -_signed_dist),
         0.0,
     )
 
@@ -572,7 +606,7 @@ def precompute_feature_series(df: pd.DataFrame, spy_df: pd.DataFrame) -> pd.Data
     # Sadece feature kolonlarini dondur
     feat_cols = [
         "open", "high", "low", "close", "volume",
-        "rvol", "close_strength", "prior_20d_high", "breakout_dist",
+        "rvol", "close_strength", "prior_20d_high", "breakout_dist", "extension_pct",
         "vol_wavg_20d", "above_volwavg", "obv_slope_10",
         "atr5", "atr14", "atr20", "atr_ratio",
         "sma50", "sma200", "prev_close", "gap_pct", "rs_10d", "rs_valid",
@@ -593,6 +627,10 @@ def passes_filters_row(row) -> bool:
             return False
         if row["breakout_dist"] > MAX_DIST:
             return False
+        # EK: asiri uzamis hisseleri ele
+        _ext = row.get("extension_pct", 0.0) if hasattr(row, "get") else 0.0
+        if pd.notna(_ext) and _ext > 0.10:
+            return False
         if REQ_VOLWAVG and not bool(row["above_volwavg"]):
             return False
         if REQ_POS_RS:
@@ -612,6 +650,13 @@ def score_row(row) -> float:
     s_rvol = _clip((row["rvol"] - 1.0) / 4.0)
     s_close = _clip(row["close_strength"])
     s_breakout = _clip(1.0 - (row["breakout_dist"] / 0.05))
+    # DUZELTILDI: uzamis hisseler icin extension penalty (backtest'te de uygulanmali)
+    _ext = row.get("extension_pct", 0.0) if hasattr(row, "get") else 0.0
+    if pd.isna(_ext):
+        _ext = 0.0
+    if _ext > 0.03:
+        _ext_penalty = _clip((_ext - 0.03) / 0.10)
+        s_breakout = s_breakout * (1.0 - _ext_penalty)
     s_volwavg = 1.0 if bool(row["above_volwavg"]) else 0.0
     s_obv = 1.0 if row["obv_slope_10"] > 0 else 0.0
     s_atr = _clip((row["atr_ratio"] - 0.80) / 0.40) if pd.notna(row["atr_ratio"]) else 0.0
@@ -1525,17 +1570,47 @@ with tab2:
         "expectancy / win-rate / max drawdown / Kelly hesaplar."
     )
 
+    # Sidebar EXIT_MODE ile otomatik senkron default
+    _default_bt_exit = (
+        "Ertesi gun OPEN"
+        if EXIT_MODE == "MOO Gap Capture (onerilen)"
+        else "Stop veya TP vurursa, yoksa CLOSE"
+    )
+    _bt_exit_options = [
+        "Ertesi gun OPEN",
+        "Ertesi gun HIGH (en iyi durum)",
+        "Ertesi gun CLOSE",
+        "Stop veya TP vurursa, yoksa CLOSE",
+    ]
+
     colA, colB, colC = st.columns(3)
     with colA:
         bt_days = st.number_input("Backtest gun sayisi", 30, 360, 120, 30)
     with colB:
-        bt_exit = st.selectbox("Cikis modu",
-                               ["Ertesi gun OPEN",
-                                "Ertesi gun HIGH (en iyi durum)",
-                                "Ertesi gun CLOSE",
-                                "Stop veya TP vurursa, yoksa CLOSE"])
+        bt_exit = st.selectbox(
+            "Cikis modu",
+            _bt_exit_options,
+            index=_bt_exit_options.index(_default_bt_exit),
+            help=(
+                "MOO simulasyonu: 'Ertesi gun OPEN' sec. "
+                "TP1/TP2 Hold simulasyonu: 'Stop veya TP vurursa, yoksa CLOSE' sec. "
+                "Varsayilan sidebar'daki EXIT_MODE'a gore otomatik ayarlanir."
+            ),
+        )
     with colC:
         bt_universe_size = st.number_input("Evren buyuklugu (TV tarayicisi icin)", 50, 1500, 500, 50)
+
+    # Uyari: exit mode sidebar ile ayni degilse
+    if (EXIT_MODE == "MOO Gap Capture (onerilen)") and bt_exit != "Ertesi gun OPEN":
+        st.warning(
+            "Sidebar'da **MOO Gap Capture** secili ama backtest cikis modu '"
+            f"{bt_exit}'. MOO'yu dogru simule etmek icin 'Ertesi gun OPEN' secmelisin."
+        )
+    elif (EXIT_MODE == "TP1/TP2 Hold") and bt_exit not in ("Stop veya TP vurursa, yoksa CLOSE", "Ertesi gun CLOSE"):
+        st.warning(
+            "Sidebar'da **TP1/TP2 Hold** secili ama backtest cikis modu farkli. "
+            "Dogru simulasyon icin 'Stop veya TP vurursa, yoksa CLOSE' sec."
+        )
 
     st.caption(
         "Not: Backtest icin sabit bir sembol listesi kullanilir "
@@ -1550,17 +1625,30 @@ with tab2:
             if "SPY" not in symbols:
                 symbols.append("SPY")
 
+            # Bellek uyarisi: 500+ sembol x 300+ gun = Render free tier icin kritik
+            _est_rows = len(symbols) * (bt_days + 120)
+            if _est_rows > 250_000:
+                st.warning(
+                    f"Dikkat: ~{_est_rows:,} satir veri indirilecek "
+                    f"({len(symbols)} sembol x {bt_days+120} gun). "
+                    f"Render free tier'da bellek sorunu olabilir. "
+                    f"Eger boş ekran dönerse, evreni 'Sabit Liste' yerine 'TV (scanner)' yap "
+                    f"veya bt gün sayısını 180'e düşür."
+                )
+
             st.info(f"{len(symbols)} sembol uzerinde backtest yapilacak (kaynak: {UNIVERSE_SOURCE}).")
 
             # --- Alpaca'dan veri indir (kucuk batch'lerle) ---
-            status.info("Asama 2/4: Alpaca'dan gunluk bar verisi indiriliyor...")
+            # Warmup 120 gun (20/50/100g rolling'ler icin yeterli; 260 gun gereksiz RAM kullanir)
+            warmup_days = 120
+            status.info(f"Asama 2/4: Alpaca'dan gunluk bar verisi indiriliyor ({bt_days + warmup_days} gun)...")
             bars_map: dict[str, pd.DataFrame] = {}
             step = 50  # Daha kucuk batch, hata izolasyonu icin
             progress = st.progress(0.0, text="0/0")
             total = len(symbols)
             for i in range(0, total, step):
                 chunk = symbols[i:i + step]
-                got = fetch_daily_bars_batch(client, chunk, days=bt_days + 260)
+                got = fetch_daily_bars_batch(client, chunk, days=bt_days + warmup_days)
                 bars_map.update(got)
                 done = min(i + step, total)
                 progress.progress(done / total, text=f"{done}/{total} sembol")
@@ -1587,12 +1675,20 @@ with tab2:
                     fs = precompute_feature_series(bars_map[sym], spy_df)
                     if not fs.empty:
                         feat_map[sym] = fs
+                        # Bellek tasarrufu: bars_map'te yalniz exit simulasyonu icin gereken
+                        # OHLC + index tutalim (adjusted close zaten feature'da)
+                        bars_map[sym] = bars_map[sym][["open", "high", "low", "close"]].copy()
+                    else:
+                        del bars_map[sym]
                 except Exception:
-                    pass
+                    if sym in bars_map:
+                        del bars_map[sym]
                 if (i + 1) % 10 == 0 or i == len(syms_list) - 1:
                     prog3.progress((i + 1) / len(syms_list), text=f"{i+1}/{len(syms_list)}")
             prog3.empty()
 
+            import gc
+            gc.collect()
             st.info(f"{len(feat_map)} sembolde gosterge hesaplandi.")
 
             # --- Asama 4: Tarihleri tara, sinyal uret, ertesi gun simulasyonu ---
@@ -1620,8 +1716,16 @@ with tab2:
                     close = float(row["close"])
                     atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else np.nan
                     breakout_dist = float(row["breakout_dist"])
+                    _ext_bt = row.get("extension_pct", 0.0) if hasattr(row, "get") else 0.0
+                    if pd.isna(_ext_bt):
+                        _ext_bt = 0.0
 
-                    breakout_mode = pd.notna(prior_high) and breakout_dist <= BREAKOUT_NEAR_PCT
+                    # DUZELTILDI: breakout_mode uzamis hisselerde kapatilir
+                    breakout_mode = (
+                        pd.notna(prior_high)
+                        and breakout_dist <= BREAKOUT_NEAR_PCT
+                        and _ext_bt <= 0.02
+                    )
                     if breakout_mode:
                         entry = max(close, float(prior_high) * (1 + ENTRY_BUFFER_PCT))
                     else:
@@ -1658,14 +1762,33 @@ with tab2:
                         tp1 = round(entry + TP1_R * risk, 4)
                         tp2 = round(entry + TP2_R * risk, 4)
 
-                    # Ertesi gun bar'ini bul
+                    # Ertesi gun bar'ini bul (D+1 = giris gunu)
                     full_df = bars_map[sym]
                     next_bars = full_df.loc[full_df.index > dt]
                     if next_bars.empty:
                         continue
                     next_bar = next_bars.iloc[0]
 
-                    filled = float(next_bar["low"]) <= entry
+                    n_open = float(next_bar["open"])
+                    n_high = float(next_bar["high"])
+                    n_low = float(next_bar["low"])
+                    n_close = float(next_bar["close"])
+
+                    # DUZELTILDI: BUY-STOP fill mantigi
+                    # Entry kapanisin UZERINDE -> hisse yukari kirarsa fill olur
+                    # - Gap-up (open >= entry): fill at open (entry'den daha iyi olabilir)
+                    # - Intraday cross (high >= entry): fill at entry
+                    # - Hicbiri: no fill
+                    if n_open >= entry:
+                        fill_px = n_open
+                        filled = True
+                    elif n_high >= entry:
+                        fill_px = entry
+                        filled = True
+                    else:
+                        fill_px = None
+                        filled = False
+
                     if not filled:
                         trades.append({
                             "date": dt.date(), "symbol": sym, "score": score,
@@ -1675,18 +1798,22 @@ with tab2:
                         })
                         continue
 
-                    n_open = float(next_bar["open"])
-                    n_high = float(next_bar["high"])
-                    n_low = float(next_bar["low"])
-                    n_close = float(next_bar["close"])
-
+                    # DUZELTILDI: MOO exit D+2 open (D+1 giris gunu; MOO sabah ertesi gun)
                     if bt_exit == "Ertesi gun OPEN":
-                        exit_px = n_open; result = "OPEN"
+                        # D+2 bar'ini bul
+                        d2_bars = full_df.loc[full_df.index > next_bar.name]
+                        if d2_bars.empty:
+                            continue  # D+2 verisi yok, trade atla
+                        d2_bar = d2_bars.iloc[0]
+                        exit_px = float(d2_bar["open"])
+                        result = "MOO_D2"
                     elif bt_exit == "Ertesi gun HIGH (en iyi durum)":
-                        exit_px = n_high; result = "HIGH"
+                        exit_px = n_high; result = "HIGH_D1"
                     elif bt_exit == "Ertesi gun CLOSE":
-                        exit_px = n_close; result = "CLOSE"
+                        exit_px = n_close; result = "CLOSE_D1"
                     else:
+                        # Stop/TP/Close D+1'de takip edilir
+                        # Fill price'tan stop'a gore dusuk seviyeye indiyse stop tetiklenir
                         if n_low <= stop:
                             exit_px = stop; result = "STOP"
                         elif n_high >= tp2:
@@ -1694,12 +1821,14 @@ with tab2:
                         elif n_high >= tp1:
                             exit_px = tp1; result = "TP1"
                         else:
-                            exit_px = n_close; result = "CLOSE"
+                            exit_px = n_close; result = "CLOSE_D1"
 
-                    ret_pct = (exit_px - entry) / entry
+                    # DUZELTILDI: gerçek fill_px kullanılır (entry değil)
+                    ret_pct = (exit_px - fill_px) / fill_px
                     trades.append({
                         "date": dt.date(), "symbol": sym, "score": score,
-                        "entry": round(entry, 4), "exit": round(exit_px, 4),
+                        "entry": round(entry, 4), "fill": round(fill_px, 4),
+                        "exit": round(exit_px, 4),
                         "stop": round(stop, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4),
                         "filled": True, "ret_pct": round(ret_pct * 100, 3),
                         "result": result,
